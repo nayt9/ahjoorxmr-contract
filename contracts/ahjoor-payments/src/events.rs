@@ -125,6 +125,14 @@ pub struct PaymentAuthorized {
     pub capture_deadline: u64,
 }
 
+/// Event: Payment created with a merchant-defined expiry override (#130)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentExpiryOverride {
+    pub payment_id: u32,
+    pub expiry_seconds: u64,
+}
+
 /// Event: Authorized payment captured by merchant — funds released (#127)
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -159,6 +167,21 @@ pub struct SubscriptionCharged {
 pub struct SubscriptionCancelled {
     pub subscription_id: u32,
     pub cancelled_by: Address,
+}
+
+/// Event: Subscription created with a trial period (#133)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SubscriptionTrialStarted {
+    pub subscription_id: u32,
+    pub trial_ends_at: u64,
+}
+
+/// Event: Subscription trial ended on first successful charge (#133)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SubscriptionTrialEnded {
+    pub subscription_id: u32,
 }
 
 /// Event: Merchant settlement batch processed.
@@ -384,6 +407,14 @@ pub fn emit_payment_authorized(e: &Env, payment_id: u32, capture_deadline: u64) 
     .publish(e);
 }
 
+pub fn emit_payment_expiry_override(e: &Env, payment_id: u32, expiry_seconds: u64) {
+    PaymentExpiryOverride {
+        payment_id,
+        expiry_seconds,
+    }
+    .publish(e);
+}
+
 pub fn emit_payment_captured(e: &Env, payment_id: u32) {
     PaymentCaptured { payment_id }.publish(e);
 }
@@ -428,6 +459,18 @@ pub fn emit_subscription_cancelled(e: &Env, subscription_id: u32, cancelled_by: 
         cancelled_by,
     }
     .publish(e);
+}
+
+pub fn emit_subscription_trial_started(e: &Env, subscription_id: u32, trial_ends_at: u64) {
+    SubscriptionTrialStarted {
+        subscription_id,
+        trial_ends_at,
+    }
+    .publish(e);
+}
+
+pub fn emit_subscription_trial_ended(e: &Env, subscription_id: u32) {
+    SubscriptionTrialEnded { subscription_id }.publish(e);
 }
 
 pub fn emit_batch_settlement_processed(
@@ -840,118 +883,93 @@ pub fn emit_notification_key_removed(e: &Env, merchant: Address) {
     NotificationKeyRemoved { merchant }.publish(e);
 }
 
-// ---------------------------------------------------------------------------
-// Task 1: External ID Events
-// ---------------------------------------------------------------------------
+// --- Token Swap Events ---
 
-/// Event: Payment indexed by merchant external_id
+/// Event: Payment swapped and settled
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct PaymentIndexedByExternalId {
+pub struct PaymentSwappedAndSettled {
     pub payment_id: u32,
-    pub external_id: BytesN<32>,
-}
-
-pub fn emit_payment_indexed_by_external_id(e: &Env, payment_id: u32, external_id: BytesN<32>) {
-    PaymentIndexedByExternalId { payment_id, external_id }.publish(e);
-}
-
-// ---------------------------------------------------------------------------
-// Task 2: Multi-Sig Approval Events
-// ---------------------------------------------------------------------------
-
-/// Event: A signer approved a PendingApproval payment
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct PaymentApproved {
-    pub payment_id: u32,
-    pub signer: Address,
-}
-
-/// Event: Approval window expired; payment auto-cancelled
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct PaymentApprovalExpired {
-    pub payment_id: u32,
-}
-
-pub fn emit_payment_approved(e: &Env, payment_id: u32, signer: Address) {
-    PaymentApproved { payment_id, signer }.publish(e);
-}
-
-pub fn emit_payment_approval_expired(e: &Env, payment_id: u32) {
-    PaymentApprovalExpired { payment_id }.publish(e);
-}
-
-// ---------------------------------------------------------------------------
-// Task 3: Voucher Events
-// ---------------------------------------------------------------------------
-
-/// Event: Merchant issued a voucher
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct VoucherIssued {
-    pub merchant: Address,
-    pub code_hash: BytesN<32>,
-    pub discount_type: crate::DiscountType,
-    pub discount_value: u32,
-    pub max_uses: u32,
-    pub expiry: u64,
-}
-
-/// Event: Voucher redeemed by a customer
-#[contractevent]
-#[derive(Clone, Debug)]
-pub struct VoucherRedeemed {
-    pub merchant: Address,
-    pub code_hash: BytesN<32>,
     pub customer: Address,
-    pub discount_applied: i128,
+    pub merchant: Address,
+    pub input_token: Address,
+    pub output_token: Address,
+    pub input_amount: i128,
+    pub output_amount: i128,
 }
 
-/// Event: Voucher revoked by merchant
+/// Event: Payment swap failed
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct VoucherRevoked {
-    pub merchant: Address,
-    pub code_hash: BytesN<32>,
+pub struct PaymentSwapFailed {
+    pub payment_id: u32,
+    pub customer: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub reason: Symbol,
 }
 
-/// Event: Voucher exhausted (all uses consumed)
+/// Event: Merchant preferred token set
 #[contractevent]
 #[derive(Clone, Debug)]
-pub struct VoucherExhausted {
+pub struct PreferredTokenSet {
     pub merchant: Address,
-    pub code_hash: BytesN<32>,
+    pub token: Address,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn emit_voucher_issued(
-    e: &Env,
-    merchant: Address,
-    code_hash: BytesN<32>,
-    discount_type: crate::DiscountType,
-    discount_value: u32,
-    max_uses: u32,
-    expiry: u64,
-) {
-    VoucherIssued { merchant, code_hash, discount_type, discount_value, max_uses, expiry }.publish(e);
+/// Event: Swap router set
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SwapRouterSet {
+    pub router: Address,
 }
 
-pub fn emit_voucher_redeemed(
+// --- Helper Emission Functions ---
+
+pub fn emit_payment_swapped_and_settled(
     e: &Env,
-    merchant: Address,
-    code_hash: BytesN<32>,
+    payment_id: u32,
     customer: Address,
-    discount_applied: i128,
+    merchant: Address,
+    input_token: Address,
+    output_token: Address,
+    input_amount: i128,
+    output_amount: i128,
 ) {
-    VoucherRedeemed { merchant, code_hash, customer, discount_applied }.publish(e);
+    PaymentSwappedAndSettled {
+        payment_id,
+        customer,
+        merchant,
+        input_token,
+        output_token,
+        input_amount,
+        output_amount,
+    }
+    .publish(e);
 }
 
-pub fn emit_voucher_revoked(e: &Env, merchant: Address, code_hash: BytesN<32>) {
-    VoucherRevoked { merchant, code_hash }.publish(e);
+pub fn emit_payment_swap_failed(
+    e: &Env,
+    payment_id: u32,
+    customer: Address,
+    token: Address,
+    amount: i128,
+    reason: Symbol,
+) {
+    PaymentSwapFailed {
+        payment_id,
+        customer,
+        token,
+        amount,
+        reason,
+    }
+    .publish(e);
 }
 
-pub fn emit_voucher_exhausted(e: &Env, merchant: Address, code_hash: BytesN<32>) {
-    VoucherExhausted { merchant, code_hash }.publish(e);
+pub fn emit_preferred_token_set(e: &Env, merchant: Address, token: Address) {
+    PreferredTokenSet { merchant, token }.publish(e);
+}
+
+pub fn emit_swap_router_set(e: &Env, router: Address) {
+    SwapRouterSet { router }.publish(e);
 }

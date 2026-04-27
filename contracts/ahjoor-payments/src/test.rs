@@ -5188,6 +5188,383 @@ fn test_invoice_hash_consistency() {
 }
 
 // ===========================================================================
+//  #133 — Subscription Trial Period
+// ===========================================================================
+
+#[test]
+fn test_subscription_without_trial_charges_immediately() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &None,
+    );
+
+    s.client.charge_subscription(&sub_id);
+    let sub = s.client.get_subscription(&sub_id);
+    assert_eq!(sub.charges_count, 1);
+    assert_eq!(s.token_client.balance(&merchant), 100);
+}
+
+#[test]
+fn test_subscription_with_zero_trial_charges_immediately() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(0),
+    );
+
+    s.client.charge_subscription(&sub_id);
+    assert_eq!(s.client.get_subscription(&sub_id).charges_count, 1);
+}
+
+#[test]
+#[should_panic]
+fn test_charge_during_trial_panics() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(86_400),
+    );
+
+    s.client.charge_subscription(&sub_id);
+}
+
+#[test]
+fn test_charge_after_trial_succeeds() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(86_400),
+    );
+
+    s.env.ledger().with_mut(|l| l.timestamp += 86_400 + 1);
+
+    s.client.charge_subscription(&sub_id);
+    assert_eq!(s.client.get_subscription(&sub_id).charges_count, 1);
+    assert_eq!(s.token_client.balance(&merchant), 100);
+}
+
+#[test]
+fn test_get_trial_remaining_during_and_after_trial() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &Some(3600),
+    );
+
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 3600);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 1800);
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 1800);
+
+    s.env.ledger().with_mut(|l| l.timestamp += 1800);
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 0);
+}
+
+#[test]
+fn test_subscription_without_trial_reports_zero_remaining() {
+    let s = setup();
+    s.init();
+    let subscriber = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&subscriber, &10_000);
+
+    let sub_id = s.client.create_subscription_with_trial(
+        &subscriber, &merchant, &100, &s.token_addr, &60, &10, &None,
+    );
+
+    assert_eq!(s.client.get_trial_remaining(&sub_id), 0);
+//  #132 — Customer Payment History Pagination
+// ===========================================================================
+
+fn seed_customer_payments(s: &TestSetup, customer: &Address, merchant: &Address, count: u32) {
+    s.client.set_merchant_open_mode(&true);
+    s.token_admin_client.mint(customer, &(count as i128 * 100));
+    for _ in 0..count {
+        s.client
+            .create_payment(customer, merchant, &10, &s.token_addr, &None, &None, &None);
+    }
+}
+
+#[test]
+fn test_pagination_first_page() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    seed_customer_payments(&s, &customer, &merchant, 25);
+
+    let page = s.client.get_customer_payments_page(&customer, &0, &10);
+
+    assert_eq!(page.payments.len(), 10);
+    assert_eq!(page.total_count, 25);
+    assert!(page.has_more);
+}
+
+#[test]
+fn test_pagination_middle_page() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    seed_customer_payments(&s, &customer, &merchant, 25);
+
+    let page = s.client.get_customer_payments_page(&customer, &1, &10);
+
+    assert_eq!(page.payments.len(), 10);
+    assert_eq!(page.total_count, 25);
+    assert!(page.has_more);
+}
+
+#[test]
+fn test_pagination_last_partial_page() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    seed_customer_payments(&s, &customer, &merchant, 25);
+
+    let page = s.client.get_customer_payments_page(&customer, &2, &10);
+
+    assert_eq!(page.payments.len(), 5);
+    assert_eq!(page.total_count, 25);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn test_pagination_past_end_returns_empty() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    seed_customer_payments(&s, &customer, &merchant, 5);
+
+    let page = s.client.get_customer_payments_page(&customer, &10, &10);
+
+    assert_eq!(page.payments.len(), 0);
+    assert_eq!(page.total_count, 5);
+    assert!(!page.has_more);
+}
+
+#[test]
+fn test_pagination_empty_customer() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+
+    let page = s.client.get_customer_payments_page(&customer, &0, &10);
+
+    assert_eq!(page.payments.len(), 0);
+    assert_eq!(page.total_count, 0);
+    assert!(!page.has_more);
+}
+
+#[test]
+#[should_panic(expected = "page_size exceeds maximum of 50")]
+fn test_pagination_rejects_oversize_page() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+
+    s.client.get_customer_payments_page(&customer, &0, &51);
+}
+
+#[test]
+#[should_panic(expected = "page_size must be greater than 0")]
+fn test_pagination_rejects_zero_page_size() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+
+    s.client.get_customer_payments_page(&customer, &0, &0);
+}
+
+#[test]
+fn test_get_customer_payment_count_matches_pagination_total() {
+    let s = setup();
+    s.init();
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    seed_customer_payments(&s, &customer, &merchant, 7);
+
+    assert_eq!(s.client.get_customer_payment_count(&customer), 7);
+    let page = s.client.get_customer_payments_page(&customer, &0, &10);
+    assert_eq!(page.total_count, 7);
+}
+
+#[test]
+fn test_get_customer_payment_count_returns_zero_for_unknown_customer() {
+    let s = setup();
+    s.init();
+    let unknown = Address::generate(&s.env);
+    assert_eq!(s.client.get_customer_payment_count(&unknown), 0);
+}
+
+// ===========================================================================
+//  #130 — Merchant-Defined Payment Expiry Override
+// ===========================================================================
+
+#[test]
+fn test_expiry_override_bounds_default_when_unset() {
+    let s = setup();
+    s.init();
+    // Defaults: 60..=2_592_000
+    assert_eq!(s.client.get_min_payment_expiry(), 60);
+    assert_eq!(s.client.get_max_payment_expiry(), 30 * 24 * 60 * 60);
+}
+
+#[test]
+fn test_admin_can_update_expiry_bounds() {
+    let s = setup();
+    s.init();
+    s.client.set_payment_expiry_bounds(&120, &86_400);
+    assert_eq!(s.client.get_min_payment_expiry(), 120);
+    assert_eq!(s.client.get_max_payment_expiry(), 86_400);
+}
+
+#[test]
+#[should_panic(expected = "min_expiry must be <= max_expiry")]
+fn test_set_bounds_rejects_inverted_range() {
+    let s = setup();
+    s.init();
+    s.client.set_payment_expiry_bounds(&500, &100);
+}
+
+#[test]
+#[should_panic(expected = "min_expiry must be greater than 0")]
+fn test_set_bounds_rejects_zero_min() {
+    let s = setup();
+    s.init();
+    s.client.set_payment_expiry_bounds(&0, &86_400);
+}
+
+#[test]
+fn test_create_payment_with_default_expiry_uses_global_timeout() {
+    let s = setup();
+    s.init();
+    s.client.set_merchant_open_mode(&true);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let now = s.env.ledger().timestamp();
+    let pid = s.client.create_payment_with_expiry(
+        &customer, &merchant, &100, &s.token_addr,
+        &None, &None, &None, &None, &None, &None,
+    );
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.expires_at, now + s.client.get_payment_timeout());
+}
+
+#[test]
+fn test_create_payment_with_custom_expiry_overrides_default() {
+    let s = setup();
+    s.init();
+    s.client.set_merchant_open_mode(&true);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let now = s.env.ledger().timestamp();
+    let custom_expiry: u64 = 3600;
+    let pid = s.client.create_payment_with_expiry(
+        &customer, &merchant, &100, &s.token_addr,
+        &None, &None, &None, &None, &None, &Some(custom_expiry),
+    );
+    let payment = s.client.get_payment(&pid);
+    assert_eq!(payment.expires_at, now + custom_expiry);
+    assert_ne!(payment.expires_at, now + s.client.get_payment_timeout());
+}
+
+#[test]
+fn test_create_payment_at_min_boundary_succeeds() {
+    let s = setup();
+    s.init();
+    s.client.set_payment_expiry_bounds(&60, &86_400);
+    s.client.set_merchant_open_mode(&true);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment_with_expiry(
+        &customer, &merchant, &100, &s.token_addr,
+        &None, &None, &None, &None, &None, &Some(60),
+    );
+    let payment = s.client.get_payment(&pid);
+    let now = s.env.ledger().timestamp();
+    assert_eq!(payment.expires_at, now + 60);
+}
+
+#[test]
+fn test_create_payment_at_max_boundary_succeeds() {
+    let s = setup();
+    s.init();
+    s.client.set_payment_expiry_bounds(&60, &86_400);
+    s.client.set_merchant_open_mode(&true);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    let pid = s.client.create_payment_with_expiry(
+        &customer, &merchant, &100, &s.token_addr,
+        &None, &None, &None, &None, &None, &Some(86_400),
+    );
+    let payment = s.client.get_payment(&pid);
+    let now = s.env.ledger().timestamp();
+    assert_eq!(payment.expires_at, now + 86_400);
+}
+
+#[test]
+#[should_panic(expected = "expiry_seconds is below the configured minimum")]
+fn test_create_payment_below_min_expiry_panics() {
+    let s = setup();
+    s.init();
+    s.client.set_payment_expiry_bounds(&60, &86_400);
+    s.client.set_merchant_open_mode(&true);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    s.client.create_payment_with_expiry(
+        &customer, &merchant, &100, &s.token_addr,
+        &None, &None, &None, &None, &None, &Some(30),
+    );
+}
+
+#[test]
+#[should_panic(expected = "expiry_seconds exceeds the configured maximum")]
+fn test_create_payment_above_max_expiry_panics() {
+    let s = setup();
+    s.init();
+    s.client.set_payment_expiry_bounds(&60, &86_400);
+    s.client.set_merchant_open_mode(&true);
+    let customer = Address::generate(&s.env);
+    let merchant = Address::generate(&s.env);
+    s.token_admin_client.mint(&customer, &1000);
+
+    s.client.create_payment_with_expiry(
+        &customer, &merchant, &100, &s.token_addr,
+        &None, &None, &None, &None, &None, &Some(86_500),
 //  #135 Dynamic Slippage Tolerance Configuration Per Payment
 // ===========================================================================
 

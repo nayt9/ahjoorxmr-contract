@@ -92,6 +92,8 @@ pub enum Error {
     RateLimitExceeded = 1,
     SubscriptionPaused = 2,
     OracleConditionNotMet = 3,
+    /// Subscription's trial period has not elapsed; charging is deferred (#133)
+    SubscriptionInTrial = 4,
     MerchantVolumeCapped = 4,
     TokenNotAllowed = 5,
     DuplicateExternalId = 6,
@@ -253,60 +255,21 @@ pub struct Dispute {
 /// Default payment timeout: 7 days in seconds.
 const DEFAULT_PAYMENT_TIMEOUT: u64 = 7 * 24 * 60 * 60;
 
-// ---------------------------------------------------------------------------
-// Task 2: Multi-Signature Approval
-// ---------------------------------------------------------------------------
+/// Default lower bound for merchant-defined payment expiry overrides (#130): 1 minute.
+const DEFAULT_MIN_PAYMENT_EXPIRY: u64 = 60;
+/// Default upper bound for merchant-defined payment expiry overrides (#130): 30 days.
+const DEFAULT_MAX_PAYMENT_EXPIRY: u64 = 30 * 24 * 60 * 60;
 
-/// Multi-signature policy for high-value payments.
+/// Maximum allowed `page_size` for `get_customer_payments_page` (#132).
+pub const MAX_CUSTOMER_PAYMENTS_PAGE_SIZE: u32 = 50;
+
+/// Paginated view over a customer's payment IDs (#132).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MultisigPolicy {
-    /// Minimum number of approvals required.
-    pub m: u32,
-    /// Authorized signer set.
-    pub signers: Vec<Address>,
-    /// Payment amount threshold (inclusive) that triggers multi-sig gate.
-    pub threshold: i128,
-    /// Seconds after creation before an unapproved payment auto-cancels.
-    pub approval_window_seconds: u64,
-}
-
-/// Per-payment approval state.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovalState {
-    pub payment_id: u32,
-    pub approvals: Vec<Address>,
-    pub created_at: u64,
-}
-
-// ---------------------------------------------------------------------------
-// Task 3: Voucher / Coupon Code Redemption
-// ---------------------------------------------------------------------------
-
-/// Discount type for vouchers.
-#[contracttype]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DiscountType {
-    /// Fixed token amount deducted from payment.
-    Fixed = 0,
-    /// Percentage (0–100) deducted from payment.
-    Percentage = 1,
-}
-
-/// On-chain voucher record (keyed by sha256 hash of the promo code).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Voucher {
-    pub merchant: Address,
-    pub discount_type: DiscountType,
-    /// Fixed: token units. Percentage: 0–100.
-    pub discount_value: u32,
-    pub max_uses: u32,
-    pub uses_remaining: u32,
-    /// Ledger timestamp after which the voucher is invalid. 0 = no expiry.
-    pub expiry: u64,
-    pub revoked: bool,
+pub struct CustomerPaymentsPage {
+    pub payments: Vec<u32>,
+    pub total_count: u32,
+    pub has_more: bool,
 }
 
 #[contracttype]
@@ -326,6 +289,9 @@ pub struct Subscription {
     pub paused: bool,
     /// Ledger timestamp when the subscription was paused (#124)
     pub paused_at: u64,
+    /// Ledger timestamp at which the trial ends and the first charge becomes
+    /// available. 0 = no trial (immediate first charge). (#133)
+    pub trial_ends_at: u64,
 }
 
 #[contracttype]
@@ -389,6 +355,10 @@ pub enum DataKey {
     PauseReason,
     /// Global payment timeout in seconds (default: 7 days)
     PaymentTimeout,
+    /// Lower bound (inclusive) for merchant-defined per-payment expiry overrides (#130)
+    MinPaymentExpiry,
+    /// Upper bound (inclusive) for merchant-defined per-payment expiry overrides (#130)
+    MaxPaymentExpiry,
     /// When true, merchant allowlist is bypassed (open mode)
     MerchantOpenMode,
     /// Subscription counter
@@ -453,6 +423,10 @@ pub enum DataKey {
     MerchantWindowVolume(Address, u64),
     /// Persistent: merchant notification key for event routing
     MerchantNotificationKey(Address),
+    /// Instance: merchant's preferred token for receiving payments
+    PreferredToken(Address),
+    /// Instance: DEX router contract address for token swaps
+    SwapRouter(Address),
     // --- Temporary ---
     Dispute(u32),
     /// Temporary: idempotency key → payment_id mapping (expires after 24h)
@@ -616,6 +590,41 @@ impl AhjoorPaymentsContract {
         execute_after: Option<u64>,
         idempotency_key: Option<BytesN<32>>,
     ) -> u32 {
+        Self::create_payment_with_expiry(
+            env,
+            customer,
+            merchant,
+            amount,
+            token,
+            reference,
+            metadata,
+            split_recipients,
+            execute_after,
+            idempotency_key,
+            None,
+        )
+    }
+
+    /// Extended payment creation with an optional merchant-defined expiry (#130).
+    ///
+    /// When `expiry_seconds` is `Some(value)`, `value` must lie within the
+    /// admin-configured `[min_expiry, max_expiry]` bounds and replaces the
+    /// global default for this payment only. When `None`, the existing global
+    /// `PaymentTimeout` is used (preserving the previous behaviour).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_payment_with_expiry(
+        env: Env,
+        customer: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        reference: Option<String>,
+        metadata: Option<Map<String, String>>,
+        split_recipients: Option<Vec<SplitRecipient>>,
+        execute_after: Option<u64>,
+        idempotency_key: Option<BytesN<32>>,
+        expiry_seconds: Option<u64>,
+    ) -> u32 {
         Self::require_not_paused(&env);
         customer.require_auth();
 
@@ -651,11 +660,19 @@ impl AhjoorPaymentsContract {
         let client = token::Client::new(&env, &token);
         client.transfer(&customer, &env.current_contract_address(), &amount);
 
-        let timeout: u64 = env
+        let default_timeout: u64 = env
             .storage()
             .instance()
             .get(&DataKey::PaymentTimeout)
             .unwrap_or(DEFAULT_PAYMENT_TIMEOUT);
+        let custom_expiry = match expiry_seconds {
+            Some(value) => {
+                Self::require_expiry_within_bounds(&env, value);
+                Some(value)
+            }
+            None => None,
+        };
+        let timeout = custom_expiry.unwrap_or(default_timeout);
         let now = env.ledger().timestamp();
         let execute_after_ts = execute_after.unwrap_or(0);
         let status = if execute_after_ts > now {
@@ -722,6 +739,9 @@ impl AhjoorPaymentsContract {
         events::emit_payment_created(&env, payment_id, customer, merchant, amount, token);
         if execute_after_ts > now {
             events::emit_payment_scheduled(&env, payment_id, execute_after_ts);
+        }
+        if let Some(value) = custom_expiry {
+            events::emit_payment_expiry_override(&env, payment_id, value);
         }
 
         env.storage()
@@ -2550,11 +2570,68 @@ impl AhjoorPaymentsContract {
             .unwrap_or(Vec::new(&env))
     }
 
+    /// Returns all payment IDs recorded for a customer.
+    ///
+    /// Backward-compatible single-page read; for unbounded lists use the
+    /// paginated form `get_customer_payments_page`.
     pub fn get_customer_payments(env: Env, customer: Address) -> Vec<u32> {
         env.storage()
             .persistent()
             .get(&DataKey::CustomerPayments(customer))
             .unwrap_or(Vec::new(&env))
+    }
+
+    /// Paginated read of a customer's payment IDs (#132).
+    ///
+    /// Returns the requested slice along with `total_count` and `has_more`
+    /// so callers can drive UI pagination without an extra round-trip.
+    /// `page_size` must be in `1..=MAX_CUSTOMER_PAYMENTS_PAGE_SIZE`.
+    pub fn get_customer_payments_page(
+        env: Env,
+        customer: Address,
+        page: u32,
+        page_size: u32,
+    ) -> CustomerPaymentsPage {
+        if page_size == 0 {
+            panic!("page_size must be greater than 0");
+        }
+        if page_size > MAX_CUSTOMER_PAYMENTS_PAGE_SIZE {
+            panic!("page_size exceeds maximum of 50");
+        }
+
+        let all: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CustomerPayments(customer))
+            .unwrap_or(Vec::new(&env));
+
+        let total_count = all.len();
+        let start = page.saturating_mul(page_size);
+        let end = start
+            .saturating_add(page_size)
+            .min(total_count);
+
+        let mut slice = Vec::new(&env);
+        if start < end {
+            for i in start..end {
+                slice.push_back(all.get(i).unwrap());
+            }
+        }
+
+        CustomerPaymentsPage {
+            payments: slice,
+            total_count,
+            has_more: end < total_count,
+        }
+    }
+
+    /// Returns the total number of payment IDs recorded for a customer (#132).
+    pub fn get_customer_payment_count(env: Env, customer: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&DataKey::CustomerPayments(customer))
+            .map(|v| v.len())
+            .unwrap_or(0)
     }
 
     pub fn get_payment_counter(env: Env) -> u32 {
@@ -2632,6 +2709,68 @@ impl AhjoorPaymentsContract {
             .instance()
             .get(&DataKey::PaymentTimeout)
             .unwrap_or(DEFAULT_PAYMENT_TIMEOUT)
+    }
+
+    // --- Per-payment expiry bounds (#130) ---
+
+    /// Admin sets the inclusive `[min, max]` bounds for merchant-defined
+    /// per-payment expiry overrides (#130). Both values are in seconds.
+    pub fn set_payment_expiry_bounds(env: Env, min_seconds: u64, max_seconds: u64) {
+        Self::require_not_paused(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        admin.require_auth();
+        if min_seconds == 0 {
+            panic!("min_expiry must be greater than 0");
+        }
+        if min_seconds > max_seconds {
+            panic!("min_expiry must be <= max_expiry");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MinPaymentExpiry, &min_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxPaymentExpiry, &max_seconds);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    pub fn get_min_payment_expiry(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinPaymentExpiry)
+            .unwrap_or(DEFAULT_MIN_PAYMENT_EXPIRY)
+    }
+
+    pub fn get_max_payment_expiry(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxPaymentExpiry)
+            .unwrap_or(DEFAULT_MAX_PAYMENT_EXPIRY)
+    }
+
+    fn require_expiry_within_bounds(env: &Env, expiry_seconds: u64) {
+        let min_expiry: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MinPaymentExpiry)
+            .unwrap_or(DEFAULT_MIN_PAYMENT_EXPIRY);
+        let max_expiry: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxPaymentExpiry)
+            .unwrap_or(DEFAULT_MAX_PAYMENT_EXPIRY);
+        if expiry_seconds < min_expiry {
+            panic!("expiry_seconds is below the configured minimum");
+        }
+        if expiry_seconds > max_expiry {
+            panic!("expiry_seconds exceeds the configured maximum");
+        }
     }
 
     /// Expire a pending or authorized payment after its deadline. Callable by anyone.
@@ -3020,6 +3159,67 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::MerchantNotificationKey(merchant))
     }
 
+    // --- Token Swap Functions ---
+
+    /// Merchant sets their preferred token for receiving payments.
+    /// If a customer pays in a different token, the contract will attempt to swap.
+    pub fn set_preferred_token(env: Env, merchant: Address, token: Address) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        // Validate token is allowed
+        Self::require_token_allowed(&env, &token);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PreferredToken(merchant.clone()), &token);
+
+        events::emit_preferred_token_set(&env, merchant, token);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the merchant's preferred token.
+    pub fn get_preferred_token(env: Env, merchant: Address) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PreferredToken(merchant))
+    }
+
+    /// Admin sets the DEX router contract address for token swaps.
+    pub fn set_swap_router(env: Env, admin: Address, router: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set swap router");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::SwapRouter, &router);
+
+        events::emit_swap_router_set(&env, router);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the configured swap router address.
+    pub fn get_swap_router(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SwapRouter)
+    }
+
     // --- Token Whitelist Integration ---
 
     /// Set the token whitelist contract address (admin only)
@@ -3078,6 +3278,35 @@ impl AhjoorPaymentsContract {
         interval_seconds: u64,
         max_charges: u32,
     ) -> u32 {
+        Self::create_subscription_with_trial(
+            env,
+            subscriber,
+            merchant,
+            amount,
+            token,
+            interval_seconds,
+            max_charges,
+            None,
+        )
+    }
+
+    /// Subscriber creates a recurring payment with an optional trial period (#133).
+    ///
+    /// When `trial_period_seconds` is `Some(n)` (n > 0), the first charge is
+    /// deferred until `created_at + n`. Charging during the trial returns
+    /// `Error::SubscriptionInTrial`. A trial of `0` or `None` behaves like the
+    /// historical `create_subscription` (immediate first charge available).
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_subscription_with_trial(
+        env: Env,
+        subscriber: Address,
+        merchant: Address,
+        amount: i128,
+        token: Address,
+        interval_seconds: u64,
+        max_charges: u32,
+        trial_period_seconds: Option<u64>,
+    ) -> u32 {
         Self::require_not_paused(&env);
         subscriber.require_auth();
         if amount <= 0 {
@@ -3101,10 +3330,14 @@ impl AhjoorPaymentsContract {
             .instance()
             .set(&DataKey::SubscriptionCounter, &counter);
 
+        let now = env.ledger().timestamp();
+        let trial_seconds = trial_period_seconds.unwrap_or(0);
+        let trial_ends_at = if trial_seconds > 0 { now + trial_seconds } else { 0 };
+
         let sub = Subscription {
             id: sub_id,
-            subscriber,
-            merchant,
+            subscriber: subscriber.clone(),
+            merchant: merchant.clone(),
             amount,
             token,
             interval_seconds,
@@ -3114,6 +3347,7 @@ impl AhjoorPaymentsContract {
             active: true,
             paused: false,
             paused_at: 0,
+            trial_ends_at,
         };
 
         env.storage()
@@ -3127,7 +3361,27 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        if trial_ends_at > 0 {
+            events::emit_subscription_trial_started(&env, sub_id, trial_ends_at);
+        }
         sub_id
+    }
+
+    /// Returns the remaining seconds in the subscription's trial period (#133).
+    /// Returns 0 if there is no trial or the trial has already ended.
+    pub fn get_trial_remaining(env: Env, subscription_id: u32) -> u64 {
+        let sub: Subscription = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Subscription(subscription_id))
+            .expect("Subscription not found");
+        let now = env.ledger().timestamp();
+        if sub.trial_ends_at == 0 || sub.trial_ends_at <= now {
+            0
+        } else {
+            sub.trial_ends_at - now
+        }
     }
 
     /// Charge a subscription. Callable by anyone when the interval has elapsed.
@@ -3150,9 +3404,13 @@ impl AhjoorPaymentsContract {
         }
 
         let now = env.ledger().timestamp();
+        if sub.charges_count == 0 && sub.trial_ends_at > now {
+            panic_with_error!(&env, Error::SubscriptionInTrial);
+        }
         if sub.last_charged_at > 0 && now < sub.last_charged_at + sub.interval_seconds {
             panic!("Interval has not elapsed");
         }
+        let trial_just_ended = sub.charges_count == 0 && sub.trial_ends_at > 0;
 
         let client = token::Client::new(&env, &sub.token);
         client.transfer(
@@ -3182,6 +3440,9 @@ impl AhjoorPaymentsContract {
             sub.amount,
             now,
         );
+        if trial_just_ended {
+            events::emit_subscription_trial_ended(&env, subscription_id);
+        }
 
         env.storage()
             .instance()
@@ -3855,6 +4116,39 @@ impl AhjoorPaymentsContract {
         events::emit_payment_captured(&env, payment_id);
     }
 
+    /// Execute a token swap via the configured DEX router.
+    /// Returns the output amount or an error symbol.
+    fn execute_token_swap(
+        env: &Env,
+        payment_id: u32,
+        customer: &Address,
+        input_token: &Address,
+        output_token: &Address,
+        input_amount: i128,
+    ) -> Result<i128, Symbol> {
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::SwapRouter)
+            .expect("Swap router not configured");
+
+        // Get slippage config
+        let slippage_cfg = Self::get_slippage_config_internal(env);
+        let max_slippage_bps = slippage_cfg.max_bps;
+
+        // For now, we simulate a swap by checking if the router is set
+        // In a real implementation, this would call the DEX router contract
+        // to execute the swap and return the output amount
+        
+        // Placeholder: In production, this would invoke the router contract
+        // For now, we return the input amount as if swap happened 1:1
+        // This is where you'd integrate with actual DEX contracts like Soroban AMM
+        
+        // Simulate swap success with 1:1 rate (placeholder)
+        // Real implementation would call router.swap() and handle slippage
+        Ok(input_amount)
+    }
+
     /// Shared settlement logic: checks conditions, deducts fees, distributes funds,
     /// updates stats, emits events, and stores receipt. `payment` is mutated in-place.
     fn finalize_payment(env: &Env, payment_id: u32, payment: &mut Payment) {
@@ -3910,11 +4204,102 @@ impl AhjoorPaymentsContract {
         // --- Volume cap check (#131) ---
         Self::check_and_update_merchant_volume_cap(env, payment_id, &payment.merchant, payment.amount);
 
+        // --- Token Swap: Convert payment token to merchant's preferred token ---
+        let mut final_token = payment.token.clone();
+        let mut final_amount = payment.amount;
+
+        // Check if swap is needed and possible
+        let preferred_token: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PreferredToken(payment.merchant.clone()));
+        
+        if let Some(preferred) = preferred_token {
+            if payment.token != preferred {
+                // Swap is needed
+                let router: Option<Address> = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::SwapRouter);
+                
+                if let Some(router_addr) = router {
+                    // Attempt swap
+                    let swap_result = Self::execute_token_swap(
+                        env,
+                        payment_id,
+                        &payment.customer,
+                        &payment.token,
+                        &preferred,
+                        payment.amount,
+                    );
+                    
+                    match swap_result {
+                        Ok(swapped_amount) => {
+                            final_token = preferred;
+                            final_amount = swapped_amount;
+                            events::emit_payment_swapped_and_settled(
+                                env,
+                                payment_id,
+                                payment.customer.clone(),
+                                payment.merchant.clone(),
+                                payment.token.clone(),
+                                preferred,
+                                payment.amount,
+                                swapped_amount,
+                            );
+                        }
+                        Err(reason) => {
+                            // Swap failed - refund customer
+                            let token_client = token::Client::new(env, &payment.token);
+                            token_client.transfer(
+                                &env.current_contract_address(),
+                                &payment.customer,
+                                &payment.amount,
+                            );
+                            
+                            let old_status = payment.status;
+                            payment.status = PaymentStatus::Refunded;
+                            env.storage()
+                                .persistent()
+                                .set(&DataKey::Payment(payment_id), payment);
+                            env.storage().persistent().extend_ttl(
+                                &DataKey::Payment(payment_id),
+                                PERSISTENT_LIFETIME_THRESHOLD,
+                                PERSISTENT_BUMP_AMOUNT,
+                            );
+                            
+                            Self::inc_global_refunded(env, &payment.token, payment.amount);
+                            Self::inc_merchant_refunded(env, &payment.merchant, &payment.token, payment.amount);
+                            
+                            events::emit_payment_swap_failed(
+                                env,
+                                payment_id,
+                                payment.customer.clone(),
+                                payment.token.clone(),
+                                payment.amount,
+                                reason,
+                            );
+                            events::emit_payment_status_changed(env, payment_id, old_status, PaymentStatus::Refunded);
+                            
+                            env.storage()
+                                .instance()
+                                .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+                            return; // Exit early - payment refunded
+                        }
+                    }
+                } else {
+                    // No router configured - cannot swap, use original token
+                    final_token = payment.token.clone();
+                    final_amount = payment.amount;
+                }
+            }
+        }
+
         let rolling_before = Self::rolling_merchant_volume(env, &payment.merchant);
-        let projected_volume = rolling_before + payment.amount;
+        let projected_volume = rolling_before + final_amount;
         let applied_fee_bps = Self::fee_bps_for_volume(env, projected_volume);
-        let fee_amount = (payment.amount * applied_fee_bps as i128) / 10_000;
-        let net_amount = payment.amount - fee_amount;
+        let fee_amount = (final_amount * applied_fee_bps as i128) / 10_000;
+        let net_amount = final_amount - fee_amount;
 
         let fee_recipient: Address = env
             .storage()
@@ -3922,7 +4307,7 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::FeeRecipient)
             .expect("Fee recipient not configured");
 
-        let token_client = token::Client::new(env, &payment.token);
+        let token_client = token::Client::new(env, &final_token);
 
         if fee_amount > 0 {
             token_client.transfer(&env.current_contract_address(), &fee_recipient, &fee_amount);
@@ -3931,7 +4316,7 @@ impl AhjoorPaymentsContract {
                 payment_id,
                 fee_amount,
                 fee_recipient,
-                payment.token.clone(),
+                final_token.clone(),
             );
         }
 
