@@ -74,6 +74,7 @@ pub struct PaymentCreated {
     pub merchant: Address,
     pub amount: i128,
     pub token: Address,
+    pub notification_key: soroban_sdk::Bytes,
 }
 
 /// Event: Batch payment operation completed
@@ -102,6 +103,7 @@ pub struct PaymentCompleted {
     pub merchant: Address,
     pub amount: i128,
     pub completed_at: u64,
+    pub notification_key: soroban_sdk::Bytes,
 }
 
 /// Event: Payment expired — funds returned to customer
@@ -112,6 +114,7 @@ pub struct PaymentExpired {
     pub customer: Address,
     pub amount: i128,
     pub expired_at: u64,
+    pub notification_key: soroban_sdk::Bytes,
 }
 
 /// Event: Payment authorized by merchant — funds held in escrow (#127)
@@ -183,6 +186,7 @@ pub struct PaymentDisputed {
     pub payment_id: u32,
     pub customer: Address,
     pub reason: String,
+    pub notification_key: soroban_sdk::Bytes,
 }
 
 /// Event: Dispute resolved by admin
@@ -279,12 +283,20 @@ pub fn emit_payment_created(
     amount: i128,
     token: Address,
 ) {
+    // Get notification key for the merchant
+    let notification_key = e
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::MerchantNotificationKey(merchant.clone()))
+        .unwrap_or(soroban_sdk::Bytes::new(e));
+
     PaymentCreated {
         payment_id,
         customer,
         merchant,
         amount,
         token,
+        notification_key,
     }
     .publish(e);
 }
@@ -324,11 +336,19 @@ pub fn emit_payment_completed(
     amount: i128,
     completed_at: u64,
 ) {
+    // Get notification key for the merchant
+    let notification_key = e
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::MerchantNotificationKey(merchant.clone()))
+        .unwrap_or(soroban_sdk::Bytes::new(e));
+
     PaymentCompleted {
         payment_id,
         merchant,
         amount,
         completed_at,
+        notification_key,
     }
     .publish(e);
 }
@@ -340,11 +360,26 @@ pub fn emit_payment_expired(
     amount: i128,
     expired_at: u64,
 ) {
+    // Get the payment to find the merchant for notification key lookup
+    let payment: crate::Payment = e
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::Payment(payment_id))
+        .expect("Payment not found");
+
+    // Get notification key for the merchant
+    let notification_key = e
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::MerchantNotificationKey(payment.merchant))
+        .unwrap_or(soroban_sdk::Bytes::new(e));
+
     PaymentExpired {
         payment_id,
         customer,
         amount,
         expired_at,
+        notification_key,
     }
     .publish(e);
 }
@@ -428,10 +463,25 @@ pub fn emit_batch_settlement_processed(
 }
 
 pub fn emit_payment_disputed(e: &Env, payment_id: u32, customer: Address, reason: String) {
+    // Get the payment to find the merchant for notification key lookup
+    let payment: crate::Payment = e
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::Payment(payment_id))
+        .expect("Payment not found");
+
+    // Get notification key for the merchant
+    let notification_key = e
+        .storage()
+        .persistent()
+        .get(&crate::DataKey::MerchantNotificationKey(payment.merchant))
+        .unwrap_or(soroban_sdk::Bytes::new(e));
+
     PaymentDisputed {
         payment_id,
         customer,
         reason,
+        notification_key,
     }
     .publish(e);
 }
@@ -723,4 +773,85 @@ pub fn emit_collateral_slashed(e: &Env, merchant: Address, amount: i128, payment
         payment_id,
     }
     .publish(e);
+}
+
+// --- Slippage Tolerance Event (#135) ---
+
+/// Event: Slippage tolerance applied to a multi-token payment
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SlippageToleranceApplied {
+    pub payment_id: u32,
+    pub tolerance_bps: u32,
+    pub oracle_price: i128,
+    pub settled_amount: i128,
+}
+
+pub fn emit_slippage_tolerance_applied(
+    e: &Env,
+    payment_id: u32,
+    tolerance_bps: u32,
+    oracle_price: i128,
+    settled_amount: i128,
+) {
+    SlippageToleranceApplied {
+        payment_id,
+        tolerance_bps,
+        oracle_price,
+        settled_amount,
+    }
+    .publish(e);
+}
+
+// --- Volume Cap Event (#131) ---
+
+/// Event: Merchant payment rejected due to volume cap
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct VolumeCapped {
+    pub merchant: Address,
+    pub payment_id: u32,
+    pub current_volume: i128,
+    pub cap: i128,
+}
+
+pub fn emit_volume_capped(
+    e: &Env,
+    merchant: Address,
+    payment_id: u32,
+    current_volume: i128,
+    cap: i128,
+) {
+    VolumeCapped {
+        merchant,
+        payment_id,
+        current_volume,
+        cap,
+    }
+    .publish(e);
+}
+
+// --- Notification Key Events ---
+
+/// Event: Merchant registered a notification key
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct NotificationKeyRegistered {
+    pub merchant: Address,
+    pub key: soroban_sdk::Bytes,
+}
+
+/// Event: Merchant removed their notification key
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct NotificationKeyRemoved {
+    pub merchant: Address,
+}
+
+pub fn emit_notification_key_registered(e: &Env, merchant: Address, key: soroban_sdk::Bytes) {
+    NotificationKeyRegistered { merchant, key }.publish(e);
+}
+
+pub fn emit_notification_key_removed(e: &Env, merchant: Address) {
+    NotificationKeyRemoved { merchant }.publish(e);
 }

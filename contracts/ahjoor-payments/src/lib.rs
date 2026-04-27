@@ -4,6 +4,7 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, Bytes,
     BytesN, Env, Map, String, Symbol, Vec,
 };
+use ahjoor_token_whitelist::TokenWhitelistClient;
 
 /// Maximum length (bytes) for the optional payment reference string.
 const MAX_REFERENCE_LEN: u32 = 64;
@@ -11,6 +12,8 @@ const MAX_REFERENCE_LEN: u32 = 64;
 const MAX_METADATA_KEYS: u32 = 5;
 /// Maximum length (bytes) for each metadata key or value.
 const MAX_METADATA_KEY_LEN: u32 = 32;
+/// Maximum length (bytes) for merchant notification key.
+const MAX_NOTIFICATION_KEY_LEN: u32 = 128;
 
 // ---------------------------------------------------------------------------
 // Reflector-compatible oracle interface.
@@ -64,6 +67,11 @@ const DEFAULT_DISPUTE_TIMEOUT: u64 = 7 * 24 * 60 * 60; // 7 days in seconds
 /// Default rate limit: effectively disabled until admin configures stricter values.
 const DEFAULT_RATE_LIMIT_MAX_PAYMENTS: u32 = u32::MAX;
 const DEFAULT_RATE_LIMIT_WINDOW_SIZE_LEDGERS: u32 = 1;
+/// Default slippage tolerance: 50 bps (0.5%)
+const DEFAULT_SLIPPAGE_BPS: u32 = 50;
+/// Default slippage bounds
+const DEFAULT_MIN_SLIPPAGE_BPS: u32 = 0;
+const DEFAULT_MAX_SLIPPAGE_BPS: u32 = 10_000;
 /// Reflector oracle price precision: prices are scaled by 10^7
 const ORACLE_PRICE_PRECISION: i128 = 10_000_000;
 /// Ledger sequences per weekly bucket (~7 days at 5s/ledger = 120_960 ledgers)
@@ -84,6 +92,8 @@ pub enum Error {
     RateLimitExceeded = 1,
     SubscriptionPaused = 2,
     OracleConditionNotMet = 3,
+    MerchantVolumeCapped = 4,
+    TokenNotAllowed = 5,
 }
 
 /// Direction for oracle price condition (#125)
@@ -183,8 +193,8 @@ pub struct Payment {
     pub tags: Option<Vec<Symbol>>,
     /// Ledger timestamp after which an authorized payment can no longer be captured. 0 = not authorized.
     pub capture_deadline: u64,
-    /// Optional oracle price condition required for completion (#125)
-    pub release_condition: Option<OracleCondition>,
+    // Optional oracle price condition required for completion (#125)
+    // pub release_condition: Option<OracleCondition>,
 }
 
 #[contracttype]
@@ -274,6 +284,23 @@ pub struct RateLimitConfig {
     pub window_size_ledgers: u32,
 }
 
+/// Slippage tolerance configuration for multi-token payments (#135)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlippageConfig {
+    pub default_bps: u32,
+    pub min_bps: u32,
+    pub max_bps: u32,
+}
+
+/// Per-merchant volume cap configuration (#131)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VolumeCap {
+    pub cap_amount: i128,
+    pub window_seconds: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CustomerRateLimit {
@@ -331,6 +358,8 @@ pub enum DataKey {
     FeeRecipient,
     /// Volume-based fee tiers sorted by min_volume ascending.
     FeeTiers,
+    /// Token whitelist contract address
+    TokenWhitelistContract,
     // --- Persistent ---
     Payment(u32),
     CustomerPayments(Address),
@@ -368,6 +397,15 @@ pub enum DataKey {
     MerchantCollateral(Address),
     /// Instance: minimum collateral required for merchant approval (#129)
     MinCollateral,
+    /// Instance: global slippage tolerance config for multi-token payments (#135)
+    SlippageConfig,
+    /// Persistent: per-merchant volume cap config (#131)
+    VolumeCap(Address),
+    /// Persistent: per-merchant volume within a time window bucket (#131)
+    /// Key: (merchant, window_bucket) where window_bucket = timestamp / window_seconds
+    MerchantWindowVolume(Address, u64),
+    /// Persistent: merchant notification key for event routing
+    MerchantNotificationKey(Address),
     // --- Temporary ---
     Dispute(u32),
     /// Temporary: idempotency key → payment_id mapping (expires after 24h)
@@ -581,6 +619,9 @@ impl AhjoorPaymentsContract {
         Self::validate_metadata(&env, &metadata);
         Self::validate_split_recipients(&split_recipients);
 
+        // Token whitelist validation
+        Self::require_token_allowed(&env, &token);
+
         // Merchant allowlist check (#58)
         Self::require_merchant_approved(&env, &merchant);
 
@@ -626,7 +667,7 @@ impl AhjoorPaymentsContract {
             category: None,
             tags: None,
             capture_deadline: 0,
-            release_condition: None,
+            // // release_condition: None,
         };
 
         // Persistent: per-payment record with individual TTL
@@ -720,6 +761,7 @@ impl AhjoorPaymentsContract {
 
             Self::validate_reference(&env, &request.reference);
             Self::validate_metadata(&env, &request.metadata);
+            Self::require_token_allowed(&env, &request.token);
             Self::require_merchant_approved(&env, &request.merchant);
 
             let client = token::Client::new(&env, &request.token);
@@ -743,7 +785,7 @@ impl AhjoorPaymentsContract {
                 category: None,
                 tags: None,
                 capture_deadline: 0,
-                release_condition: None,
+                // release_condition: None,
             };
 
             // Persistent: per-payment record with individual TTL
@@ -1213,7 +1255,8 @@ impl AhjoorPaymentsContract {
     ///   2. Validates price freshness against `max_oracle_age`.
     ///   3. Calculates `required_token_amount` from `amount_usdc` and the rate.
     ///   4. Applies slippage tolerance: rejects if effective rate deviates
-    ///      more than `slippage_bps` basis points from the oracle rate.
+    ///      more than `slippage_tolerance_bps` basis points from the oracle rate.
+    ///      If omitted, uses the global default from SlippageConfig.
     ///   5. Transfers `required_token_amount` of `payment_token` from customer
     ///      to contract (escrow).
     ///   6. Records the payment with `amount = amount_usdc` and `token = usdc_token`
@@ -1229,15 +1272,27 @@ impl AhjoorPaymentsContract {
         merchant: Address,
         amount_usdc: i128,
         payment_token: Address,
-        slippage_bps: u32,
+        slippage_tolerance_bps: Option<u32>,
     ) -> u32 {
         Self::require_not_paused(&env);
         if amount_usdc <= 0 {
             panic!("Payment amount must be positive");
         }
-        if slippage_bps > 10_000 {
-            panic!("slippage_bps cannot exceed 10000");
-        }
+
+        // Resolve slippage: use provided value or fall back to global default
+        let slippage_cfg = Self::get_slippage_config_internal(&env);
+        let slippage_bps = match slippage_tolerance_bps {
+            Some(bps) => {
+                if bps < slippage_cfg.min_bps {
+                    panic!("slippage_bps below minimum allowed");
+                }
+                if bps > slippage_cfg.max_bps {
+                    panic!("slippage_bps exceeds maximum allowed");
+                }
+                bps
+            }
+            None => slippage_cfg.default_bps,
+        };
 
         let usdc_token: Address = env
             .storage()
@@ -1249,6 +1304,7 @@ impl AhjoorPaymentsContract {
         if payment_token == usdc_token {
             customer.require_auth();
             Self::enforce_rate_limit(&env, &customer, 1);
+            Self::require_token_allowed(&env, &payment_token);
             Self::require_merchant_approved(&env, &merchant);
 
             let client = token::Client::new(&env, &payment_token);
@@ -1279,7 +1335,7 @@ impl AhjoorPaymentsContract {
                 category: None,
                 tags: None,
                 capture_deadline: 0,
-                release_condition: None,
+                // release_condition: None,
             };
 
             env.storage()
@@ -1309,6 +1365,8 @@ impl AhjoorPaymentsContract {
 
         customer.require_auth();
         Self::enforce_rate_limit(&env, &customer, 1);
+        Self::require_token_allowed(&env, &payment_token);
+        Self::require_merchant_approved(&env, &merchant);
 
         let oracle_addr: Address = env
             .storage()
@@ -1396,7 +1454,7 @@ impl AhjoorPaymentsContract {
             category: None,
             tags: None,
             capture_deadline: 0,
-            release_condition: None,
+            // release_condition: None,
         };
 
         env.storage()
@@ -1409,6 +1467,15 @@ impl AhjoorPaymentsContract {
         );
 
         Self::add_customer_payment(&env, &customer, payment_id);
+
+        // Emit SlippageToleranceApplied event (#135)
+        events::emit_slippage_tolerance_applied(
+            &env,
+            payment_id,
+            slippage_bps,
+            price_data.price,
+            amount_usdc,
+        );
 
         events::emit_multi_token_payment_created(
             &env,
@@ -1612,6 +1679,96 @@ impl AhjoorPaymentsContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Admin updates the global slippage tolerance config for multi-token payments (#135).
+    /// default_bps must be within [min_bps, max_bps].
+    pub fn update_slippage_config(
+        env: Env,
+        admin: Address,
+        default_bps: u32,
+        min_bps: u32,
+        max_bps: u32,
+    ) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can update slippage config");
+        }
+        if max_bps > 10_000 {
+            panic!("max_bps cannot exceed 10000");
+        }
+        if min_bps > max_bps {
+            panic!("min_bps cannot exceed max_bps");
+        }
+        if default_bps < min_bps || default_bps > max_bps {
+            panic!("default_bps must be within [min_bps, max_bps]");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::SlippageConfig, &SlippageConfig { default_bps, min_bps, max_bps });
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the current slippage tolerance config.
+    pub fn get_slippage_config(env: Env) -> SlippageConfig {
+        Self::get_slippage_config_internal(&env)
+    }
+
+    /// Admin sets a volume cap for a merchant (#131).
+    /// cap_amount: maximum cumulative settlement volume within window_seconds.
+    /// Set cap_amount = 0 to remove the cap.
+    pub fn set_merchant_volume_cap(
+        env: Env,
+        admin: Address,
+        merchant: Address,
+        cap_amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set merchant volume cap");
+        }
+        if cap_amount < 0 {
+            panic!("cap_amount cannot be negative");
+        }
+        if cap_amount > 0 && window_seconds == 0 {
+            panic!("window_seconds must be positive when cap is set");
+        }
+        let key = DataKey::VolumeCap(merchant.clone());
+        if cap_amount == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &VolumeCap { cap_amount, window_seconds });
+            env.storage().persistent().extend_ttl(
+                &key,
+                PERSISTENT_LIFETIME_THRESHOLD,
+                PERSISTENT_BUMP_AMOUNT,
+            );
+        }
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Returns the volume cap for a merchant, if set (#131).
+    pub fn get_merchant_volume_cap(env: Env, merchant: Address) -> Option<VolumeCap> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::VolumeCap(merchant))
     }
 
     /// Propose a new admin address. Only the current admin can propose.
@@ -2278,6 +2435,8 @@ impl AhjoorPaymentsContract {
             .get(&DataKey::UsdcToken)
             .expect("Collateral token not configured; call set_oracle first");
 
+        Self::require_token_allowed(&env, &usdc_token);
+
         let token_client = token::Client::new(&env, &usdc_token);
         token_client.transfer(&merchant, &env.current_contract_address(), &amount);
 
@@ -2353,6 +2512,107 @@ impl AhjoorPaymentsContract {
             .unwrap_or(0)
     }
 
+    // --- Notification Keys ---
+
+    /// Merchant registers a notification key for event routing.
+    /// The key is included in all payment-related events for this merchant.
+    /// Key size is bounded to prevent storage abuse (max 128 bytes).
+    pub fn register_notification_key(env: Env, merchant: Address, key: Bytes) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        if key.len() > MAX_NOTIFICATION_KEY_LEN {
+            panic!("Notification key exceeds maximum length of 128 bytes");
+        }
+
+        if key.is_empty() {
+            panic!("Notification key cannot be empty");
+        }
+
+        let storage_key = DataKey::MerchantNotificationKey(merchant.clone());
+        env.storage().persistent().set(&storage_key, &key);
+        env.storage().persistent().extend_ttl(
+            &storage_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        events::emit_notification_key_registered(&env, merchant, key);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant removes their notification key.
+    /// After removal, events will include empty bytes for the notification key.
+    pub fn remove_notification_key(env: Env, merchant: Address) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+
+        let storage_key = DataKey::MerchantNotificationKey(merchant.clone());
+        env.storage().persistent().remove(&storage_key);
+
+        events::emit_notification_key_removed(&env, merchant);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the notification key for a merchant, if registered.
+    pub fn get_notification_key(env: Env, merchant: Address) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MerchantNotificationKey(merchant))
+    }
+
+    // --- Token Whitelist Integration ---
+
+    /// Set the token whitelist contract address (admin only)
+    pub fn set_token_whitelist_contract(env: Env, admin: Address, whitelist_contract: Address) {
+        Self::require_not_paused(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Not initialized");
+        if admin != stored_admin {
+            panic!("Only admin can set token whitelist contract");
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenWhitelistContract, &whitelist_contract);
+
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the token whitelist contract address
+    pub fn get_token_whitelist_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenWhitelistContract)
+    }
+
+    /// Check if a token is allowed via the whitelist contract
+    pub fn is_token_allowed(env: Env, token: Address) -> bool {
+        if let Some(whitelist_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
+        {
+            let client = TokenWhitelistClient::new(&env, &whitelist_contract);
+            client.is_token_allowed(&token)
+        } else {
+            // If no whitelist contract is set, allow all tokens (backward compatibility)
+            true
+        }
+    }
+
     // --- Subscriptions (#60) ---
 
     /// Subscriber creates a recurring payment. Signs once to authorize future charges.
@@ -2374,6 +2634,7 @@ impl AhjoorPaymentsContract {
             panic!("Interval must be positive");
         }
 
+        Self::require_token_allowed(&env, &token);
         Self::require_merchant_approved(&env, &merchant);
 
         let mut counter: u32 = env
@@ -2600,6 +2861,7 @@ impl AhjoorPaymentsContract {
 
     // --- Payment Categories (#122) ---
 
+    /*
     /// Create a payment with optional category, tags, and release condition.
     /// Category and tags enable on-chain segmentation and analytics.
     /// release_condition, if set, must be satisfied at completion time (#125).
@@ -2705,7 +2967,7 @@ impl AhjoorPaymentsContract {
 
         payment_id
     }
-
+    */
     /// Return payment IDs for a merchant + category pair, paginated.
     /// page is 0-indexed. Empty result when page exceeds available data.
     pub fn get_payments_by_category(
@@ -3020,6 +3282,21 @@ impl AhjoorPaymentsContract {
         }
     }
 
+    /// Validates that a token is allowed via the whitelist contract
+    fn require_token_allowed(env: &Env, token: &Address) {
+        if let Some(whitelist_contract) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::TokenWhitelistContract)
+        {
+            let client = TokenWhitelistClient::new(env, &whitelist_contract);
+            if !client.is_token_allowed(token) {
+                panic_with_error!(env, Error::TokenNotAllowed);
+            }
+        }
+        // If no whitelist contract is set, allow all tokens (backward compatibility)
+    }
+
     fn complete_payment_internal(env: &Env, payment_id: u32, scheduled_only: bool) {
         let mut payment: Payment = env
             .storage()
@@ -3129,6 +3406,7 @@ impl AhjoorPaymentsContract {
     /// updates stats, emits events, and stores receipt. `payment` is mutated in-place.
     fn finalize_payment(env: &Env, payment_id: u32, payment: &mut Payment) {
         // Oracle price condition check (#125)
+        /*
         if let Some(ref condition) = payment.release_condition.clone() {
             let oracle_addr: Address = env
                 .storage()
@@ -3174,6 +3452,10 @@ impl AhjoorPaymentsContract {
                 panic_with_error!(env, Error::OracleConditionNotMet);
             }
         }
+        */
+
+        // --- Volume cap check (#131) ---
+        Self::check_and_update_merchant_volume_cap(env, payment_id, &payment.merchant, payment.amount);
 
         let rolling_before = Self::rolling_merchant_volume(env, &payment.merchant);
         let projected_volume = rolling_before + payment.amount;
@@ -3842,12 +4124,65 @@ impl AhjoorPaymentsContract {
             PERSISTENT_BUMP_AMOUNT,
         );
     }
+
+    /// Returns the global slippage config, falling back to defaults (#135).
+    fn get_slippage_config_internal(env: &Env) -> SlippageConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::SlippageConfig)
+            .unwrap_or(SlippageConfig {
+                default_bps: DEFAULT_SLIPPAGE_BPS,
+                min_bps: DEFAULT_MIN_SLIPPAGE_BPS,
+                max_bps: DEFAULT_MAX_SLIPPAGE_BPS,
+            })
+    }
+
+    /// Check merchant volume cap and update window volume. Panics if cap would be exceeded (#131).
+    fn check_and_update_merchant_volume_cap(
+        env: &Env,
+        payment_id: u32,
+        merchant: &Address,
+        amount: i128,
+    ) {
+        let cap_key = DataKey::VolumeCap(merchant.clone());
+        let cap: VolumeCap = match env.storage().persistent().get(&cap_key) {
+            Some(c) => c,
+            None => return, // No cap configured — no restriction
+        };
+
+        let now = env.ledger().timestamp();
+        let bucket = now / cap.window_seconds;
+        let vol_key = DataKey::MerchantWindowVolume(merchant.clone(), bucket);
+        let current_volume: i128 = env.storage().persistent().get(&vol_key).unwrap_or(0);
+        let new_volume = current_volume
+            .checked_add(amount)
+            .expect("Volume overflow");
+
+        if new_volume > cap.cap_amount {
+            events::emit_volume_capped(env, merchant.clone(), payment_id, current_volume, cap.cap_amount);
+            panic_with_error!(env, Error::MerchantVolumeCapped);
+        }
+
+        env.storage().persistent().set(&vol_key, &new_volume);
+        env.storage().persistent().extend_ttl(
+            &vol_key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+
 }
 
 #[cfg(test)]
 mod test;
 
 #[cfg(test)]
+mod test_token_whitelist;
+
+#[cfg(test)]
 mod test_collateral;
+
+#[cfg(test)]
+mod test_notification_keys;
 
 pub use events::*;
