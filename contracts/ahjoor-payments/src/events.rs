@@ -1042,3 +1042,57 @@ pub fn emit_withdrawal_rate_limit_set(e: &Env, merchant: Address, window_seconds
 pub fn emit_withdrawal_rate_limit_exceeded(e: &Env, merchant: Address, attempted: i128, cap: i128) {
     e.events().publish((soroban_sdk::Symbol::new(e, "WdrlLimitExceeded"),), (merchant, attempted, cap));
 }
+
+// #235: Customer Spend Limit Events
+/// Event: Merchant set a per-customer spend limit
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CustomerSpendLimitSet {
+    pub merchant: Address,
+    pub customer: Address,
+    pub amount: i128,
+    pub window_seconds: u64,
+}
+
+/// Event: Customer spend limit removed
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CustomerSpendLimitRemoved {
+    pub merchant: Address,
+    pub customer: Address,
+}
+
+/// Event: Customer spend limit exceeded (payment rejected)
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct CustomerSpendLimitExceeded {
+    pub merchant: Address,
+    pub customer: Address,
+    pub attempted: i128,
+    pub cap: i128,
+}
+
+/// Event: Merchant default spend limit set
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DefaultSpendLimitSet {
+    pub merchant: Address,
+    pub amount: i128,
+    pub window_seconds: u64,
+}
+
+pub fn emit_customer_spend_limit_set(e: &Env, merchant: Address, customer: Address, amount: i128, window_seconds: u64) {
+    CustomerSpendLimitSet { merchant, customer, amount, window_seconds }.publish(e);
+}
+
+pub fn emit_customer_spend_limit_removed(e: &Env, merchant: Address, customer: Address) {
+    CustomerSpendLimitRemoved { merchant, customer }.publish(e);
+}
+
+pub fn emit_customer_spend_limit_exceeded(e: &Env, merchant: Address, customer: Address, attempted: i128, cap: i128) {
+    CustomerSpendLimitExceeded { merchant, customer, attempted, cap }.publish(e);
+}
+
+pub fn emit_default_spend_limit_set(e: &Env, merchant: Address, amount: i128, window_seconds: u64) {
+    DefaultSpendLimitSet { merchant, amount, window_seconds }.publish(e);
+}

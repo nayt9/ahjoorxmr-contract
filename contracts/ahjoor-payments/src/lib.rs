@@ -105,6 +105,8 @@ pub enum Error {
     VoucherRevoked = 12,
     VoucherNotFound = 13,
     WithdrawalRateLimitExceeded = 14,
+    /// Customer cumulative spend would exceed the merchant-configured cap (#235)
+    CustomerSpendLimitExceeded = 15,
 }
 
 /// Per-merchant withdrawal rate limit config (#231).
@@ -121,6 +123,22 @@ pub struct WithdrawalLimit {
 pub struct WithdrawalWindowState {
     pub window_start: u64,
     pub withdrawn: i128,
+}
+
+/// Per-customer (or default) spend cap config (#235).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SpendLimit {
+    pub amount: i128,
+    pub window_seconds: u64,
+}
+
+/// Tracks cumulative spend within the current rolling window (#235).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomerSpendWindow {
+    pub window_start: u64,
+    pub spent: i128,
 }
 
 /// Direction for oracle price condition (#125)
@@ -510,6 +528,12 @@ pub enum DataKey {
     MerchantWithdrawalWindow(Address),
     /// Persistent: per-merchant revenue dashboard summary (#226)
     MerchantSummary(Address),
+    /// Persistent: per-(merchant,customer) spend limit override (#235)
+    CustomerSpendLimit(Address, Address),
+    /// Persistent: merchant-level default spend limit (#235)
+    DefaultSpendLimit(Address),
+    /// Persistent: per-(merchant,customer) rolling spend window state (#235)
+    CustomerSpendWindowState(Address, Address),
 }
 
 mod events;
@@ -4261,6 +4285,9 @@ impl AhjoorPaymentsContract {
             panic!("Payment has expired");
         }
 
+        // #235: Check customer spend limit before finalizing
+        Self::check_and_update_customer_spend_limit(env, &payment.merchant, &payment.customer, payment.amount);
+
         Self::finalize_payment(env, payment_id, &mut payment);
     }
 
@@ -5712,6 +5739,116 @@ impl AhjoorPaymentsContract {
         env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
     }
 
+    // =========================================================================
+    // #235: Merchant-Level Customer Spending Limits
+    // =========================================================================
+
+    /// Merchant sets a per-customer spend cap within a rolling window.
+    pub fn set_customer_spend_limit(
+        env: Env,
+        merchant: Address,
+        customer: Address,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 {
+            panic!("Spend limit amount must be positive");
+        }
+        if window_seconds == 0 {
+            panic!("Window seconds must be positive");
+        }
+        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_customer_spend_limit_set(&env, merchant, customer, amount, window_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant removes a per-customer spend cap.
+    pub fn remove_customer_spend_limit(env: Env, merchant: Address, customer: Address) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        let key = DataKey::CustomerSpendLimit(merchant.clone(), customer.clone());
+        env.storage().persistent().remove(&key);
+        events::emit_customer_spend_limit_removed(&env, merchant, customer);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Merchant sets a global default spend cap applied to all customers without an individual override.
+    pub fn set_default_spend_limit(
+        env: Env,
+        merchant: Address,
+        amount: i128,
+        window_seconds: u64,
+    ) {
+        Self::require_not_paused(&env);
+        merchant.require_auth();
+        if amount <= 0 {
+            panic!("Spend limit amount must be positive");
+        }
+        if window_seconds == 0 {
+            panic!("Window seconds must be positive");
+        }
+        let key = DataKey::DefaultSpendLimit(merchant.clone());
+        let limit = SpendLimit { amount, window_seconds };
+        env.storage().persistent().set(&key, &limit);
+        env.storage().persistent().extend_ttl(&key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+        events::emit_default_spend_limit_set(&env, merchant, amount, window_seconds);
+        env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Get the per-customer spend limit for a merchant+customer pair.
+    pub fn get_customer_spend_limit(env: Env, merchant: Address, customer: Address) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey::CustomerSpendLimit(merchant, customer))
+    }
+
+    /// Get the default spend limit for a merchant.
+    pub fn get_default_spend_limit(env: Env, merchant: Address) -> Option<SpendLimit> {
+        env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant))
+    }
+
+    /// Check and update the customer spend window. Panics with CustomerSpendLimitExceeded if cap would be breached.
+    fn check_and_update_customer_spend_limit(env: &Env, merchant: &Address, customer: &Address, amount: i128) {
+        // Individual override takes priority over default
+        let limit_opt: Option<SpendLimit> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CustomerSpendLimit(merchant.clone(), customer.clone()))
+            .or_else(|| env.storage().persistent().get(&DataKey::DefaultSpendLimit(merchant.clone())));
+
+        let limit = match limit_opt {
+            Some(l) => l,
+            None => return, // No limit configured
+        };
+
+        let state_key = DataKey::CustomerSpendWindowState(merchant.clone(), customer.clone());
+        let now = env.ledger().timestamp();
+
+        let mut state: CustomerSpendWindow = env
+            .storage()
+            .persistent()
+            .get(&state_key)
+            .unwrap_or(CustomerSpendWindow { window_start: now, spent: 0 });
+
+        // Reset window if expired
+        if now >= state.window_start + limit.window_seconds {
+            state = CustomerSpendWindow { window_start: now, spent: 0 };
+        }
+
+        let new_total = state.spent.checked_add(amount).expect("Spend overflow");
+        if new_total > limit.amount {
+            events::emit_customer_spend_limit_exceeded(env, merchant.clone(), customer.clone(), new_total, limit.amount);
+            panic_with_error!(env, Error::CustomerSpendLimitExceeded);
+        }
+
+        state.spent = new_total;
+        env.storage().persistent().set(&state_key, &state);
+        env.storage().persistent().extend_ttl(&state_key, PERSISTENT_LIFETIME_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+
 }
 
 #[cfg(test)]
@@ -5731,5 +5868,8 @@ mod test_external_id_multisig_voucher;
 
 #[cfg(test)]
 mod test_merchant_ban;
+
+#[cfg(test)]
+mod test_spending_limit;
 
 pub use events::*;
