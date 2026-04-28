@@ -1,4 +1,4 @@
-use soroban_sdk::{contractevent, Address, BytesN, Env, String};
+use soroban_sdk::{contractevent, Address, BytesN, Env, String, Symbol};
 
 /// Event: Escrow created
 #[contractevent]
@@ -733,4 +733,15 @@ pub fn emit_arbiter_timeout_penalty_applied(e: &Env, arbiter: Address, total_tim
         total_timeouts,
     }
     .publish(e);
+}
+
+// #215: Time-locked escrow events
+pub fn emit_timelocked_escrow_created(e: &Env, escrow_id: u32, unlock_at: u64, beneficiary: Address) {
+    e.events().publish((Symbol::new(e, "TLEscrowCreated"),), (escrow_id, unlock_at, beneficiary));
+}
+pub fn emit_timelocked_funds_claimed(e: &Env, escrow_id: u32, beneficiary: Address, amount: i128) {
+    e.events().publish((Symbol::new(e, "TLFundsClaimed"),), (escrow_id, beneficiary, amount));
+}
+pub fn emit_timelocked_escrow_cancelled(e: &Env, escrow_id: u32, buyer: Address) {
+    e.events().publish((Symbol::new(e, "TLEscrowCancelled"),), (escrow_id, buyer));
 }
